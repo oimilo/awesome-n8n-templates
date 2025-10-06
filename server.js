@@ -16,6 +16,11 @@ const PORT = process.env.PORT || 3000;
 const REPO_ROOT = path.resolve(__dirname);
 const EXCLUDED_DIRS = new Set(['.git', 'node_modules']);
 const EXCLUDED_FILES = new Set(['package.json', 'package-lock.json']);
+const STOPWORDS = new Set([
+  'a','an','the','and','or','to','for','with','of','in','on','by','from','about','into','as','at','is','are',
+  'de','do','da','das','dos','para','com','no','na','nos','nas','um','uma','como','que','o','os','as','e',
+  'setup','build','create','make','how','guide','tutorial','example','agent','bot','workflow','flow'
+]);
 
 /**
  * Holds the in-memory index of JSON templates.
@@ -116,7 +121,9 @@ app.post('/refresh', async (req, res) => {
 app.get('/templates', async (req, res) => {
   try {
     await ensureIndexBuilt();
-    const q = (req.query.q || '').toString().trim().toLowerCase();
+    const qRaw = (req.query.q || '').toString().trim();
+    const qMode = ((req.query.q_mode || '').toString().toLowerCase() === 'all') ? 'all' : 'any';
+    const q = qRaw.toLowerCase();
     const dir = (req.query.dir || '').toString().trim();
     // pagination aliases (per_page/page)
     let limit = req.query.limit || req.query.per_page;
@@ -133,11 +140,26 @@ app.get('/templates', async (req, res) => {
       filtered = filtered.filter(t => t.relativePath.startsWith(dirNorm + path.sep) || t.category === dir);
     }
     if (q) {
-      filtered = filtered.filter(t => (
-        t.name.toLowerCase().includes(q) ||
-        t.relativePath.toLowerCase().includes(q) ||
-        t.category.toLowerCase().includes(q)
-      ));
+      const tokens = Array.from(new Set(q
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
+        .split(/\s+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 1 && !STOPWORDS.has(s))));
+
+      if (tokens.length) {
+        filtered = filtered.filter(t => {
+          const hay = `${t.name} ${t.relativePath} ${t.category}`.toLowerCase();
+          if (qMode === 'all') return tokens.every(tok => hay.includes(tok));
+          return tokens.some(tok => hay.includes(tok));
+        });
+      } else {
+        // fallback para consulta original quando todos tokens viram stopwords
+        filtered = filtered.filter(t => (
+          t.name.toLowerCase().includes(q) ||
+          t.relativePath.toLowerCase().includes(q) ||
+          t.category.toLowerCase().includes(q)
+        ));
+      }
     }
     const { slice, meta } = pickPagination(filtered, limit, offset);
 
