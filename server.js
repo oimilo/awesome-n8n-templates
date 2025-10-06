@@ -118,6 +118,15 @@ app.get('/templates', async (req, res) => {
     await ensureIndexBuilt();
     const q = (req.query.q || '').toString().trim().toLowerCase();
     const dir = (req.query.dir || '').toString().trim();
+    // pagination aliases (per_page/page)
+    let limit = req.query.limit || req.query.per_page;
+    let offset = req.query.offset;
+    const page = req.query.page ? parseInt(req.query.page, 10) : null;
+    if (page && !offset) {
+      const limitNum = parseInt(limit || '50', 10) || 50;
+      offset = (Math.max(page, 1) - 1) * limitNum;
+    }
+
     let filtered = templatesIndex;
     if (dir) {
       const dirNorm = dir.replace(/[\\/]+/g, path.sep);
@@ -130,17 +139,42 @@ app.get('/templates', async (req, res) => {
         t.category.toLowerCase().includes(q)
       ));
     }
-    const { slice, meta } = pickPagination(filtered, req.query.limit, req.query.offset);
-    const items = slice.map(t => ({
-      id: t.id,
-      name: t.name,
-      relativePath: t.relativePath,
-      size: t.size,
-      mtimeMs: t.mtimeMs,
-      category: t.category,
-      downloadUrl: `/download?id=${t.id}`,
-      rawUrl: `/raw?id=${t.id}`
-    }));
+    const { slice, meta } = pickPagination(filtered, limit, offset);
+
+    // fields selection
+    const allowedFields = new Set(['id','name','relativePath','size','mtimeMs','category','downloadUrl','rawUrl']);
+    const fieldsParam = (req.query.fields || '').toString().trim();
+    const requestedFields = fieldsParam
+      ? fieldsParam.split(',').map(s => s.trim()).filter(s => allowedFields.has(s))
+      : null; // null = default full set
+
+    const makeUrl = (p) => p;
+    const abs = ['1','true','yes'].includes((req.query.abs || '').toString().toLowerCase());
+    const base = abs ? `${req.protocol}://${req.get('host')}` : '';
+
+    const items = slice.map(t => {
+      const full = {
+        id: t.id,
+        name: t.name,
+        relativePath: t.relativePath,
+        size: t.size,
+        mtimeMs: t.mtimeMs,
+        category: t.category,
+        downloadUrl: makeUrl(`${base}/download?id=${t.id}`),
+        rawUrl: makeUrl(`${base}/raw?id=${t.id}`)
+      };
+      if (!requestedFields) return full;
+      const slim = {};
+      for (const f of requestedFields) slim[f] = full[f];
+      return slim;
+    });
+
+    const view = (req.query.view || '').toString();
+    if (view === 'items') {
+      res.json(items);
+      return;
+    }
+
     res.json({ ...meta, items });
   } catch (err) {
     res.status(500).json({ error: 'list_failed', message: String(err && err.message || err) });
