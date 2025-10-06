@@ -22,6 +22,57 @@ const STOPWORDS = new Set([
   'setup','build','create','make','how','guide','tutorial','example','agent','bot','workflow','flow'
 ]);
 
+const SOFT_STOPWORDS = new Set(['google','ai','openai','gemini','mistral','assistant','gpt']);
+
+const SYNONYMS = new Map([
+  ['gcal','calendar'],
+  ['calendario','calendar'],
+  ['calendário','calendar'],
+  ['cal','calendar'],
+  ['yt','youtube'],
+  ['ig','instagram'],
+  ['wa','whatsapp'],
+  ['x','twitter']
+]);
+function normalize(str) {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}+/gu, '')
+    .replace(/\s+/g, ' ') // collapse spaces
+    .trim();
+}
+
+function canonicalizeToken(tok) {
+  const n = normalize(tok);
+  return SYNONYMS.get(n) || n;
+}
+
+function rankItem(tokens, item, opts) {
+  const nameN = normalize(item.name);
+  const relN = normalize(item.relativePath);
+  const catN = normalize(item.category || '');
+  const phrase = normalize(tokens.join(' '));
+
+  let score = 0;
+  let matched = 0;
+  for (const t of tokens) {
+    let hit = false;
+    if (nameN.includes(t)) { score += 5; hit = true; }
+    if (relN.includes(t)) { score += 3; hit = true; }
+    if (catN.includes(t)) { score += 2; hit = true; }
+    if (hit) matched++;
+  }
+  if (matched === tokens.length) score += 3; // all terms matched
+  if (phrase && nameN.includes(phrase)) score += 2; // phrase match in name
+  if (opts && opts.dir) {
+    const dirN = normalize(opts.dir);
+    if (catN === dirN) score += 4;
+    if (relN.startsWith(dirN + '/')) score += 3;
+  }
+  return score;
+}
+
 /**
  * Holds the in-memory index of JSON templates.
  * Each item: { id, name, relativePath, absolutePath, size, mtimeMs, category }
@@ -139,27 +190,46 @@ app.get('/templates', async (req, res) => {
       const dirNorm = dir.replace(/[\\/]+/g, path.sep);
       filtered = filtered.filter(t => t.relativePath.startsWith(dirNorm + path.sep) || t.category === dir);
     }
+    let tokensUsed = [];
+    let simplifiedTo = '';
     if (q) {
-      const tokens = Array.from(new Set(q
+      const rawTokens = q
         .replace(/[^\p{L}\p{N}]+/gu, ' ')
         .split(/\s+/)
         .map(s => s.trim())
+        .filter(Boolean);
+
+      let tokens = Array.from(new Set(rawTokens
+        .map(canonicalizeToken)
         .filter(s => s.length > 1 && !STOPWORDS.has(s))));
 
-      if (tokens.length) {
-        filtered = filtered.filter(t => {
-          const hay = `${t.name} ${t.relativePath} ${t.category}`.toLowerCase();
-          if (qMode === 'all') return tokens.every(tok => hay.includes(tok));
-          return tokens.some(tok => hay.includes(tok));
-        });
-      } else {
-        // fallback para consulta original quando todos tokens viram stopwords
-        filtered = filtered.filter(t => (
-          t.name.toLowerCase().includes(q) ||
-          t.relativePath.toLowerCase().includes(q) ||
-          t.category.toLowerCase().includes(q)
-        ));
+      // If we still have too many generic tokens, keep the strongest
+      if (tokens.length > 2) {
+        tokens = tokens.filter(t => !SOFT_STOPWORDS.has(t));
+        if (tokens.length === 0) tokens = rawTokens.map(canonicalizeToken);
       }
+
+      tokensUsed = tokens;
+
+      const haystack = (t) => normalize(`${t.name} ${t.relativePath} ${t.category}`);
+
+      const matches = (toks, t) => {
+        const hay = haystack(t);
+        return qMode === 'all' ? toks.every(tok => hay.includes(tok)) : toks.some(tok => hay.includes(tok));
+      };
+
+      let prelim = tokens.length ? filtered.filter(t => matches(tokens, t)) : filtered;
+
+      // Fallback: if no results and multi-term, try the strongest single token
+      if (!prelim.length && tokens.length > 1) {
+        const strong = tokens.find(t => !SOFT_STOPWORDS.has(t)) || tokens[0];
+        simplifiedTo = strong;
+        prelim = filtered.filter(t => haystack(t).includes(strong));
+      }
+
+      // Rank by weighted score
+      prelim.sort((a, b) => rankItem(tokens, b, { dir }) - rankItem(tokens, a, { dir }));
+      filtered = prelim;
     }
     const { slice, meta } = pickPagination(filtered, limit, offset);
 
@@ -197,7 +267,10 @@ app.get('/templates', async (req, res) => {
       return;
     }
 
-    res.json({ ...meta, items });
+    const metaExtra = {};
+    if (tokensUsed.length) metaExtra.tokens = tokensUsed;
+    if (simplifiedTo) metaExtra.simplifiedTo = simplifiedTo;
+    res.json({ ...meta, ...metaExtra, items });
   } catch (err) {
     res.status(500).json({ error: 'list_failed', message: String(err && err.message || err) });
   }
