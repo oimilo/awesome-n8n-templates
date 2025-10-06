@@ -5,7 +5,8 @@ WORKDIR /app
 # Copia apenas os manifests primeiro para otimizar cache
 COPY package.json package-lock.json* ./
 
-RUN npm ci --omit=dev --no-audit --no-fund
+# Usar install ao invés de ci para evitar falha quando não há lockfile
+RUN npm install --omit=dev --no-audit --no-fund
 
 # Copia o restante do código
 COPY . .
