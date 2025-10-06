@@ -80,6 +80,12 @@ async function buildIndex() {
   return { total: templatesIndex.length };
 }
 
+async function ensureIndexBuilt() {
+  if (!templatesIndex.length) {
+    await buildIndex();
+  }
+}
+
 function pickPagination(items, limit, offset) {
   const safeLimit = Math.min(Math.max(parseInt(limit || '50', 10) || 50, 1), 200);
   const safeOffset = Math.max(parseInt(offset || '0', 10) || 0, 0);
@@ -91,7 +97,7 @@ function pickPagination(items, limit, offset) {
 
 app.get('/health', async (req, res) => {
   try {
-    if (!templatesIndex.length) await buildIndex();
+    await ensureIndexBuilt();
     res.json({ status: 'ok', templates: templatesIndex.length, root: REPO_ROOT });
   } catch (err) {
     res.status(500).json({ error: 'health_failed', message: String(err && err.message || err) });
@@ -109,7 +115,7 @@ app.post('/refresh', async (req, res) => {
 
 app.get('/templates', async (req, res) => {
   try {
-    if (!templatesIndex.length) await buildIndex();
+    await ensureIndexBuilt();
     const q = (req.query.q || '').toString().trim().toLowerCase();
     const dir = (req.query.dir || '').toString().trim();
     let filtered = templatesIndex;
@@ -141,41 +147,92 @@ app.get('/templates', async (req, res) => {
   }
 });
 
-function resolveByIdOrPath(req) {
+function normalizeDirParam(dir) {
+  if (!dir) return '';
+  const norm = dir.toString().trim().replace(/[\\/]+/g, path.sep);
+  return norm.replace(new RegExp(`${path.sep}+$`), '');
+}
+
+async function findByFilename(filename, dir) {
+  await ensureIndexBuilt();
+  const nameLc = filename.toLowerCase();
+  let candidates = templatesIndex.filter(t => t.name.toLowerCase() === nameLc);
+  if (dir) {
+    const dirNorm = normalizeDirParam(dir);
+    const dirLc = dirNorm.toLowerCase();
+    candidates = candidates.filter(t =>
+      t.category.toLowerCase() === dirLc ||
+      t.relativePath.toLowerCase().startsWith(dirLc + path.sep)
+    );
+  }
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 0) return null;
+  const locations = candidates.map(c => c.relativePath);
+  const err = new Error('ambiguous_filename');
+  err.details = { matches: locations };
+  throw err;
+}
+
+async function resolveByQuery(req) {
   const id = (req.query.id || '').toString();
   const fileParam = (req.query.file || '').toString();
-  let relativePath = fileParam;
+  const filenameParam = (req.query.filename || '').toString();
+  const dirParam = (req.query.dir || '').toString();
+
+  // Prefer explicit id
   if (id) {
     try {
-      relativePath = fromBase64Url(id);
+      const relativePath = fromBase64Url(id);
+      const absolutePath = path.resolve(REPO_ROOT, relativePath);
+      if (!isSubPath(REPO_ROOT, absolutePath)) throw new Error('invalid_path');
+      return { relativePath, absolutePath };
     } catch (_) {
       throw new Error('invalid_id');
     }
   }
-  if (!relativePath) throw new Error('missing_file');
-  const absolutePath = path.resolve(REPO_ROOT, relativePath);
-  if (!isSubPath(REPO_ROOT, absolutePath)) throw new Error('invalid_path');
-  return { relativePath, absolutePath };
+
+  // file can be a relative path OR just a filename
+  if (fileParam) {
+    const looksLikePath = fileParam.includes('/') || fileParam.includes('\\');
+    if (looksLikePath) {
+      const relativePath = fileParam;
+      const absolutePath = path.resolve(REPO_ROOT, relativePath);
+      if (!isSubPath(REPO_ROOT, absolutePath)) throw new Error('invalid_path');
+      return { relativePath, absolutePath };
+    }
+    const found = await findByFilename(fileParam, dirParam);
+    if (!found) throw new Error('file_not_found');
+    return { relativePath: found.relativePath, absolutePath: found.absolutePath };
+  }
+
+  // explicit filename parameter
+  if (filenameParam) {
+    const found = await findByFilename(filenameParam, dirParam);
+    if (!found) throw new Error('file_not_found');
+    return { relativePath: found.relativePath, absolutePath: found.absolutePath };
+  }
+
+  throw new Error('missing_file');
 }
 
 app.get('/raw', async (req, res) => {
   try {
-    const { absolutePath } = resolveByIdOrPath(req);
+    const { absolutePath } = await resolveByQuery(req);
     await fsp.access(absolutePath, fs.constants.R_OK);
     res.type('application/json');
     res.sendFile(absolutePath);
   } catch (err) {
-    res.status(400).json({ error: 'raw_failed', message: String(err && err.message || err) });
+    res.status(400).json({ error: 'raw_failed', message: String(err && err.message || err), details: err && err.details });
   }
 });
 
 app.get('/download', async (req, res) => {
   try {
-    const { absolutePath } = resolveByIdOrPath(req);
+    const { absolutePath } = await resolveByQuery(req);
     await fsp.access(absolutePath, fs.constants.R_OK);
     res.download(absolutePath);
   } catch (err) {
-    res.status(400).json({ error: 'download_failed', message: String(err && err.message || err) });
+    res.status(400).json({ error: 'download_failed', message: String(err && err.message || err), details: err && err.details });
   }
 });
 
